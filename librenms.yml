@@ -1,0 +1,295 @@
+---
+# Ozmen Emre DEMIRKOL <ozmend@gmail.com> - 07.01.2019
+# Change hostnames according to your FQDN
+- name: LibreNMS Install 
+  hosts: nms
+#Proxy settings
+ #environment:
+  #http_proxy: http://username:password@host:port
+  #https_proxy: http://username:password@host:port
+
+  tasks:
+  - name: Install Repositories
+    yum: 
+     name:
+      - epel-release
+      - https://mirror.webtatic.com/yum/el7/webtatic-release.rpm
+     state: installed
+    register: is_installed
+    failed_when: is_installed.rc >= 2
+
+  - name: Install LibreNMS requirements
+    yum:
+     name:
+      - composer
+      - cronie
+      - fping 
+      - git
+      - httpd
+      - ImageMagick
+      - jwhois
+      - mariadb 
+      - mariadb-server 
+      - mtr
+      - MySQL-python
+      - net-snmp
+      - net-snmp-utils
+      - nmap
+      - php72w
+      - php72w-cli
+      - php72w-common
+      - php72w-curl
+      - php72w-gd
+      - php72w-mbstring
+      - php72w-mysqlnd
+      - php72w-process
+      - php72w-snmp
+      - php72w-xml
+      - php72w-zip
+      - python-memcached
+      - rrdtool
+      - policycoreutils-python
+     state: installed
+   
+  - name: Create LibreNMS user
+    user:
+     name: librenms
+     createhome: no
+     system: yes
+     home: /opt/librenms
+     state: present
+
+  - name: adding apache to librenms group
+    user:
+     name: apache
+     groups: librenms
+     append: yes
+
+  - name: check if librenms directory exists
+    stat: 
+     path: /opt/librenms
+    register: status
+
+  - name: Composer Create Project
+    composer:
+     command: create-project
+     arguments: '--keep-vcs librenms/librenms librenms dev-master'
+     working_dir: /opt
+    when: status.stat.exists == False
+
+  - name: Start MariaDB
+    systemd:
+     name: mariadb 
+     enabled: yes
+     state: started
+
+  - name: Create LibreNMS DB
+    mysql_db: 
+     login_user: root 
+     name: librenms
+     encoding: utf8
+     collation: utf8_unicode_ci
+     state: present
+
+  - name: Delete Test DB
+    mysql_db: 
+     login_user: root 
+     name: test
+     state: absent
+
+  - name: Create DB user
+    mysql_user:
+     name: librenms
+     password: librenms 
+     priv: librenms.*:ALL,GRANT
+     state: present
+  
+  - name: Add block in my.cnf
+    blockinfile:
+     path: /etc/my.cnf
+     insertafter: '^socket'
+     block: |
+       innodb_file_per_table=1
+       lower_case_table_names=0
+
+  - name: Restart MariaDB
+    systemd:
+     name: mariadb 
+     enabled: yes
+     state: restarted
+     daemon_reload: yes
+
+  - name: DateTimezone in php.ini
+    lineinfile: 
+     path: /etc/php.ini
+     regexp: '^;date.timezone ='
+     line: 'date.timezone = Europe/Istanbul'
+     state: present
+
+  - name: Create  Librenms http file
+    blockinfile:
+     path: /etc/httpd/conf.d/librenms.conf
+     create: yes
+     block: |
+        <VirtualHost *:80>
+          DocumentRoot /opt/librenms/html/
+          ServerName  nms.teidom.local
+
+          AllowEncodedSlashes NoDecode
+          <Directory "/opt/librenms/html/">
+            Require all granted
+            AllowOverride All
+            Options FollowSymLinks MultiViews
+          </Directory>
+        </VirtualHost>
+
+  - name: welcome.html remove
+    file:
+     path: /etc/httpd/conf.d/welcome.conf
+     state: absent
+
+  - name: Restart HTTPD
+    systemd:
+     name: httpd
+     enabled: yes
+     state: restarted
+     daemon_reload: yes
+
+  - name: Set selinux policy for directories
+    sefcontext:
+     target: '{{ item.target }}(/.*)?'
+     setype: "{{ item.setype }}"
+     state: present
+    register: filecontext
+    with_items:
+     - { target: '/opt/librenms/logs(/.*)?', setype: 'httpd_sys_content_t' }
+     - { target: '/opt/librenms/logs(/.*)?', setype: 'httpd_sys_rw_content_t' }
+     - { target: '/opt/librenms/rrd(/.*)?', setype: 'httpd_sys_content_t' }
+     - { target: '/opt/librenms/rrd(/.*)?', setype: 'httpd_sys_rw_content_t' }
+     - { target: '/opt/librenms/storage(/.*)?', setype: 'httpd_sys_content_t' }
+     - { target: '/opt/librenms/storage(/.*)?', setype: 'httpd_sys_rw_content_t' }
+     - { target: '/opt/librenms/bootstrap/cache(/.*)?', setype: 'httpd_sys_content_t' }
+     - { target: '/opt/librenms/bootstrap/cache(/.*)?', setype: 'httpd_sys_rw_content_t' }
+
+  - name: Apply new SELinux file context to filesystem
+    command: "restorecon -RFvv /opt/librenms/{{ item }}"
+    with_items:
+     - 'logs'
+     - 'rrd'
+     - 'storage'
+     - 'bootstrap/cache'
+
+  - name: Set httpd_can_sendmail flag on and keep it persistent across reboots
+    seboolean:
+     name: httpd_can_sendmail
+     state: yes
+     persistent: yes
+
+  - name: Create http_ping file
+    blockinfile:
+      path: /opt/http_fping.tt
+      create: yes
+      block: |
+        module http_fping 1.0;
+
+        require {
+        type httpd_t;
+        class capability net_raw;
+        class rawip_socket { getopt create setopt write read };
+        }
+
+        #============= httpd_t ==============
+        allow httpd_t self:capability net_raw;
+        allow httpd_t self:rawip_socket { getopt create setopt write read };
+
+  - name: Create selinux module 
+    command: "{{ item }}"
+    with_items:
+    - checkmodule -M -m -o /opt/http_fping.mod /opt/http_fping.tt
+    - semodule_package -o /opt/http_fping.pp -m /opt/http_fping.mod
+    - semodule -i /opt/http_fping.pp
+
+  - name: remove http_fping files
+    file:
+     path: /opt/http_fping.{{ item }}
+     state: absent
+    with_items:
+     - pp
+     - tt
+     - mod
+
+  - name: firewalld rules
+    firewalld: 
+     zone: public
+     service: "{{ item }}"
+     permanent: yes
+     immediate: yes
+     state: enabled
+    with_items:
+     - http
+     - https
+
+  - name: copy snmpd.conf
+    copy:
+     remote_src: yes
+     src: /opt/librenms/snmpd.conf.example
+     dest: /etc/snmp/snmpd.conf
+
+# Change the string as you wish
+  - name: change community string
+    replace:
+     path: /etc/snmp/snmpd.conf
+     regexp: 'RANDOMSTRINGGOESHERE'
+     replace: 'helloworld'
+
+  - name: Download distro
+    get_url:
+     url: https://raw.githubusercontent.com/librenms/librenms-agent/master/snmp/distro
+     dest: /usr/bin/distro
+     mode: "+x"
+
+  - name: Restart SNMPD
+    systemd:
+     name: snmpd
+     enabled: yes
+     state: restarted
+     daemon_reload: yes
+
+  - name: copy logrotate files
+    copy:
+     remote_src: yes
+     src: "{{ item.src }}"
+     dest: "{{ item.dest }}"
+    with_items:
+     - { src: '/opt/librenms/librenms.nonroot.cron', dest: '/etc/cron.d/librenms' }
+     - { src: '/opt/librenms/misc/librenms.logrotate', dest: '/etc/logrotate.d/librenms' }
+
+  - name: chown librenms
+    file:
+     path: /opt/librenms
+     owner: librenms
+     group: librenms
+     recurse: yes
+
+  - name: set acl
+    acl:
+     path: "/opt/librenms/{{ item }}"
+     default: yes
+     recursive: yes
+     etype: group
+     permissions: rwx 
+     state: present
+    with_items:
+    - rrd
+    - logs
+    - bootstrap/cache
+    - storage
+
+  - name: It is done
+    debug:
+     msg: "Installation is complated.
+           Now head to the web installer and follow the on-screen instructions.
+           The web installer might prompt you to create a config.php file in your librenms install location manually,
+           copying the content displayed on-screen to the file. If you have to do this,
+           please remember to set the permissions on config.php after you copied the on-screen contents to the file.
+           Run ->  chown librenms:librenms /opt/librenms/config.php"
